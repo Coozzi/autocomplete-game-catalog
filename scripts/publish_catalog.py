@@ -108,45 +108,88 @@ def fetch_discord():
 def discord_entries(records):
     if not isinstance(records, list) or len(records) > MAX_ENTRIES:
         raise ValueError("Discord response must be an array of at most 50,000 entries")
+    if not records:
+        raise ValueError("Discord catalog returned an empty feed")
     result, ids = [], set()
+    skipped = {}
+    max_reason_count = MAX_ENTRIES * MAX_PATTERNS
+
+    def count(reason):
+        skipped[reason] = min(max_reason_count, skipped.get(reason, 0) + 1)
+
     for raw in records:
         if not isinstance(raw, dict):
-            raise ValueError("Discord record is not an object")
+            count("invalid_record_type")
+            continue
         # Well-formed but unsupported records (no themes or usable Windows binary) are not catalog entries.
         ident = raw.get("id")
         if not ((isinstance(ident, str) and ident.isascii() and ident.isdecimal() and len(ident) <= 20)
                 or (isinstance(ident, int) and not isinstance(ident, bool) and 0 <= ident <= 2**64 - 1)):
-            raise ValueError("Discord record has invalid ID")
+            count("invalid_id")
+            continue
         ident = str(ident)
         name = raw.get("name")
         themes, executables = raw.get("themes"), raw.get("executables")
-        if not isinstance(name, str) or not name or len(name.encode("utf-8")) > MAX_FIELD or any(unicodedata.category(c) == "Cc" for c in name):
-            raise ValueError("Discord record has invalid name")
-        if themes is None or not isinstance(themes, list) or not 1 <= len(themes) <= 32:
+        if not isinstance(name, str):
+            count("invalid_name_type")
             continue
-        if any(not isinstance(t, str) or not t or len(t.encode("utf-8")) > MAX_FIELD or any(unicodedata.category(c) == "Cc" for c in t) for t in themes):
-            raise ValueError("Discord record has invalid themes")
-        if not isinstance(executables, list) or len(executables) > MAX_PATTERNS:
-            raise ValueError("Discord record executable list invalid or too large")
+        try:
+            name_valid = bool(name) and len(name.encode("utf-8")) <= MAX_FIELD and not any(unicodedata.category(c) == "Cc" for c in name)
+        except UnicodeEncodeError:
+            name_valid = False
+        if not name_valid:
+            count("invalid_name_value")
+            continue
+        if themes is None:
+            count("unsupported_themes")
+            continue
+        if not isinstance(themes, list) or not 1 <= len(themes) <= 32:
+            count("invalid_themes")
+            continue
+        try:
+            themes_valid = all(isinstance(t, str) and t and len(t.encode("utf-8")) <= MAX_FIELD
+                               and not any(unicodedata.category(c) == "Cc" for c in t) for t in themes)
+        except UnicodeEncodeError:
+            themes_valid = False
+        if not themes_valid:
+            count("invalid_themes")
+            continue
+        if not isinstance(executables, list):
+            count("invalid_executable_list")
+            continue
+        if len(executables) > MAX_PATTERNS:
+            count("executable_limit")
+            continue
         paths = []
         for exe in executables:
             if not isinstance(exe, dict):
-                raise ValueError("Discord executable is not an object")
-            if exe.get("is_launcher") is False and isinstance(exe.get("os"), str) and exe["os"].lower() == "win32":
-                if "name" in exe:
-                    try:
-                        paths.append(normalize_pattern(exe["name"]))
-                    except ValueError:
-                        # Invalid/generic individual executable names are excluded; other safe paths may identify the app.
-                        pass
+                count("invalid_executable_record")
+                continue
+            is_launcher, os_name, executable_name = exe.get("is_launcher"), exe.get("os"), exe.get("name")
+            if not isinstance(is_launcher, bool) or not isinstance(os_name, str):
+                count("invalid_executable_fields")
+                continue
+            if is_launcher or os_name.lower() != "win32":
+                continue
+            if not isinstance(executable_name, str):
+                count("invalid_executable_name_type")
+                continue
+            try:
+                paths.append(normalize_pattern(executable_name))
+            except (ValueError, UnicodeEncodeError):
+                # Reject unsafe/generic names without exposing upstream text in logs.
+                count("unsafe_executable_name")
         paths = sorted(set(paths))
         if not paths:
+            count("no_safe_windows_executable")
             continue
         if ident in ids:
             raise ValueError("duplicate Discord application ID")
         ids.add(ident)
         result.append({"id": ident, "name": name, "windows_executables": paths})
-    return result
+    if not result:
+        raise ValueError("Discord catalog contained no usable entries")
+    return result, dict(sorted(skipped.items()))
 
 
 def validate_previous(pointer_path):
@@ -214,7 +257,9 @@ def main():
     old_revision, previous = (0, {})
     if args.previous:
         old_revision, previous = validate_previous(args.previous)
-    fetched = discord_entries(fetch_discord())
+    fetched, skipped = discord_entries(fetch_discord())
+    if skipped:
+        print(json.dumps({"discord_skipped_reason_counts": skipped}, sort_keys=True, separators=(",", ":")), file=sys.stderr)
     additions = {}
     for entry in fetched + manual:
         ident = entry["id"]
