@@ -10,7 +10,7 @@ Limits: 5,000 manual entries, 16 executable patterns per entry, 128 UTF-8 bytes 
 
 The publisher runs daily at 02:07 Asia/Seoul, after a reviewed `manual.json` change reaches the default branch, or through `workflow_dispatch`. It merges new records with the previous snapshot, so omission from Discord's current response never removes a prior entry. A publisher run with no additions writes no files and makes no commit.
 
-The private feed is stored under `catalog/published/` for GitHub Contents API reads. Revision 1 is a full bootstrap snapshot and has no delta; its manifest pointer uses `"latest_delta": null`:
+The catalog is served from `catalog/published/` via the GitHub Contents API. The application uses anonymous reads only after this repository is public. Revision 1 is a full bootstrap snapshot and has no delta; its manifest pointer uses `"latest_delta": null`:
 
 ```json
 {"schema_version":1,"feed":"autocomplete-public-catalog","revision":1,"entry_count":345,"snapshot":{"path":"snapshots/catalog-v00000001.json","sha256":"<sha256 of canonical snapshot JSON>"},"latest_delta":null}
