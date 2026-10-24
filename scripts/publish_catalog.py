@@ -200,8 +200,12 @@ def validate_previous(pointer_path):
         raise ValueError("previous manifest pointer fields invalid")
     if pointer["schema_version"] != 1 or pointer["feed"] != "autocomplete-public-catalog":
         raise ValueError("previous manifest pointer schema/feed unsupported")
-    if not isinstance(pointer["revision"], int) or pointer["revision"] < 1:
+    if not isinstance(pointer["revision"], int) or isinstance(pointer["revision"], bool) or pointer["revision"] < 1:
         raise ValueError("previous revision invalid")
+    if not isinstance(pointer["snapshot"], dict) or pointer["snapshot"].get("path") != f"snapshots/catalog-v{pointer['revision']:08d}.json":
+        raise ValueError("previous snapshot path does not match its revision")
+    if not isinstance(pointer["entry_count"], int) or isinstance(pointer["entry_count"], bool):
+        raise ValueError("previous manifest entry count invalid")
 
     def referenced_file(ref, allowed_prefix):
         if not isinstance(ref, dict) or set(ref) != {"path", "sha256"}:
@@ -230,17 +234,24 @@ def validate_previous(pointer_path):
     digest = hashlib.sha256(canonical(entries)).hexdigest()
     if snapshot["entry_count"] != len(entries) or pointer["entry_count"] != len(entries) or snapshot["sha256"] != digest:
         raise ValueError("previous snapshot count/hash mismatch")
-    # Ensure latest_delta is present, hash-checked, and actually advances the pointer revision.
-    delta = referenced_file(pointer["latest_delta"], "deltas/")
-    if (not isinstance(delta, dict) or delta.get("schema_version") != 1
-            or delta.get("feed") != "autocomplete-public-catalog"
-            or delta.get("to_revision") != pointer["revision"]
-            or not isinstance(delta.get("operations"), list)):
-        raise ValueError("previous latest delta identity invalid")
-    delta_payload = dict(delta)
-    delta_hash = delta_payload.pop("sha256", None)
-    if set(delta) != {"schema_version", "feed", "from_revision", "to_revision", "operations", "sha256"} or delta_hash != hashlib.sha256(canonical(delta_payload)).hexdigest():
-        raise ValueError("previous latest delta schema/hash mismatch")
+    if pointer["revision"] == 1:
+        if pointer["latest_delta"] is not None:
+            raise ValueError("revision 1 must not contain a delta")
+    else:
+        expected_delta_path = f"deltas/delta-{pointer['revision']:08d}.json"
+        if not isinstance(pointer["latest_delta"], dict) or pointer["latest_delta"].get("path") != expected_delta_path:
+            raise ValueError("previous delta path does not match its revision")
+        delta = referenced_file(pointer["latest_delta"], "deltas/")
+        if (not isinstance(delta, dict) or delta.get("schema_version") != 1
+                or delta.get("feed") != "autocomplete-public-catalog"
+                or delta.get("from_revision") != pointer["revision"] - 1
+                or delta.get("to_revision") != pointer["revision"]
+                or not isinstance(delta.get("operations"), list) or not delta["operations"]):
+            raise ValueError("previous latest delta identity invalid")
+        delta_payload = dict(delta)
+        delta_hash = delta_payload.pop("sha256", None)
+        if set(delta) != {"schema_version", "feed", "from_revision", "to_revision", "operations", "sha256"} or delta_hash != hashlib.sha256(canonical(delta_payload)).hexdigest():
+            raise ValueError("previous latest delta schema/hash mismatch")
     return pointer["revision"], {entry["id"]: entry for entry in entries}
 
 
@@ -282,22 +293,29 @@ def main():
     digest = hashlib.sha256(canonical(entries)).hexdigest()
     out = Path(args.out_dir)
     snapshot_path = f"snapshots/catalog-v{revision:08d}.json"
-    delta_path = f"deltas/delta-{revision:08d}.json"
     snapshot = {"schema_version": 1, "feed": "autocomplete-public-catalog", "revision": revision,
                 "entry_count": len(entries), "entries": entries, "sha256": digest}
-    delta = {"schema_version": 1, "feed": "autocomplete-public-catalog", "from_revision": old_revision,
-             "to_revision": revision, "operations": [{"op": "add", "entry": e} for e in sorted(additions.values(), key=lambda entry: entry["id"])]}
-    delta["sha256"] = hashlib.sha256(canonical(delta)).hexdigest()
-    snapshot_bytes, delta_bytes = canonical(snapshot) + b"\n", canonical(delta) + b"\n"
+    snapshot_bytes = canonical(snapshot) + b"\n"
     if len(snapshot_bytes) > MAX_TOTAL:
         raise ValueError("serialized snapshot exceeds the 8 MiB client cache limit")
-    if len(delta_bytes) > MAX_DELTA_BYTES:
-        raise ValueError("serialized delta exceeds the 512 KiB client catch-up limit")
+    delta_path, delta_bytes = None, None
+    if old_revision > 0:
+        delta_path = f"deltas/delta-{revision:08d}.json"
+        delta = {"schema_version": 1, "feed": "autocomplete-public-catalog", "from_revision": old_revision,
+                 "to_revision": revision, "operations": [{"op": "add", "entry": e} for e in sorted(additions.values(), key=lambda entry: entry["id"])]}
+        delta["sha256"] = hashlib.sha256(canonical(delta)).hexdigest()
+        delta_bytes = canonical(delta) + b"\n"
+        if len(delta_bytes) > MAX_DELTA_BYTES:
+            raise ValueError("serialized delta exceeds the 512 KiB client catch-up limit")
     pointer = {"schema_version": 1, "feed": "autocomplete-public-catalog", "revision": revision,
                "entry_count": len(entries),
                "snapshot": {"path": snapshot_path, "sha256": hashlib.sha256(snapshot_bytes.rstrip(b"\n")).hexdigest()},
-               "latest_delta": {"path": delta_path, "sha256": hashlib.sha256(delta_bytes.rstrip(b"\n")).hexdigest()}}
-    for relative, payload in ((snapshot_path, snapshot_bytes), (delta_path, delta_bytes)):
+               "latest_delta": ({"path": delta_path, "sha256": hashlib.sha256(delta_bytes.rstrip(b"\n")).hexdigest()}
+                                if delta_path is not None and delta_bytes is not None else None)}
+    payloads = [(snapshot_path, snapshot_bytes)]
+    if delta_path is not None and delta_bytes is not None:
+        payloads.append((delta_path, delta_bytes))
+    for relative, payload in payloads:
         path = out / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
