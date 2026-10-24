@@ -1,0 +1,76 @@
+name: Publish public game catalog
+
+on:
+  schedule:
+    - cron: '7 2 * * *'
+      timezone: Asia/Seoul
+  workflow_dispatch:
+  push:
+    paths:
+      - 'catalog/manual.json'
+  pull_request:
+    paths:
+      - 'catalog/**'
+      - 'scripts/publish_catalog.py'
+      - '.github/workflows/publish-catalog.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: autocomplete-game-catalog-publish
+  cancel-in-progress: false
+
+jobs:
+  validate-contributions:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate contribution format without network access
+        run: python scripts/publish_catalog.py --manual catalog/manual.json --out-dir /tmp/catalog --validate-only
+
+  publish:
+    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check for prior pointer
+        id: previous
+        run: |
+          if [ -f catalog/published/manifest.json ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build bounded catalog revision
+        id: build
+        run: |
+          args=(--manual catalog/manual.json --out-dir catalog/published)
+          if [ "${{ steps.previous.outputs.available }}" = "true" ]; then args+=(--previous catalog/published/manifest.json); fi
+          python scripts/publish_catalog.py "${args[@]}" | tee "$RUNNER_TEMP/catalog-result.json"
+          changed=$(python -c 'import json,sys; print(str(json.load(open(sys.argv[1]))["changed"]).lower())' "$RUNNER_TEMP/catalog-result.json")
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          revision=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["revision"])' "$RUNNER_TEMP/catalog-result.json")
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+      - name: Commit generated catalog files only when changed
+        if: steps.build.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add catalog/published/
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "Publish catalog revision ${{ steps.build.outputs.revision }}"
+          git push
